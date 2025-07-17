@@ -1,0 +1,291 @@
+import math
+import pickle
+import pandas as pd
+import torch
+import numpy as np
+from torch.utils.data import TensorDataset, Dataset, DataLoader
+import scipy.sparse as sp
+from Net import B_TCN, D_GCN, NBNorm_ZeroInflated, NBNorm_MSE, ST_MSE_VIB, ST_Gauss_VIB
+import tqdm
+from sklearn import metrics
+from torch import nn
+import os
+import random
+from itertools import cycle
+from collections import Counter
+from Distance import mmd_kmeans_fixed
+device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+
+def cosine_distance(A, B):
+    """
+    A, B: (N, D) 或 (K, D)，返回每对样本的余弦距离 (N,)
+    """
+    A = A.float()
+    B = B.float()
+
+    dot_product = torch.sum(A * B, dim=1)
+    norm_A = torch.norm(A, dim=1)
+    norm_B = torch.norm(B, dim=1)
+
+    cosine_similarity = dot_product / (norm_A * norm_B + 1e-8)
+    return 1 - cosine_similarity
+
+def cosine_kmeans(X, K=4, max_iter=100):
+    """
+    基于余弦距离的 K-means 聚类
+    X: (N, D) 的 torch.Tensor
+    """
+    X = torch.tensor(X).cuda()
+    N, D = X.shape
+    X = X.float().to(X.device)
+
+    # 初始化中心（随机抽样）
+    random.seed(-1) #纽约是0
+    init_indices = random.sample(range(N), K)
+    centers = X[init_indices]
+
+    for iter in range(max_iter):
+        assignments = []
+
+        # 分配每个点到最近的中心
+        for i in range(N):
+            xi = X[i].unsqueeze(0).repeat(K, 1)
+            distances = cosine_distance(xi, centers)
+            assignments.append(torch.argmin(distances).item())
+
+        # 更新中心：取每个簇的平均向量并归一化
+        new_centers = []
+        for k in range(K):
+            indices = [i for i in range(N) if assignments[i] == k]
+            if not indices:
+                new_centers.append(centers[k])  # 避免空簇
+                continue
+            cluster_vecs = X[indices]
+            mean_vec = torch.mean(cluster_vecs, dim=0)
+            normed = mean_vec / (torch.norm(mean_vec) + 1e-8)
+            new_centers.append(normed)
+        new_centers = torch.stack(new_centers)
+
+        if torch.allclose(centers, new_centers, atol=1e-8):
+            print(f"Cosine-kmeans Converged at iter {iter}")
+            break
+        centers = new_centers
+
+    return assignments, centers
+
+
+def get_normalized_adj(A):
+    """
+    Returns the degree normalized adjacency matrix. This is for K_GCN
+    """
+    if A[0, 0] == 0:
+        A = A + np.diag(np.ones(A.shape[0], dtype=np.float32)) # if the diag has been added by 1s
+    D = np.array(np.sum(A, axis=1)).reshape((-1,))
+    D[D <= 10e-5] = 10e-5    # Prevent infs
+    diag = np.reciprocal(np.sqrt(D))
+    A_wave = np.multiply(np.multiply(diag.reshape((-1, 1)), A),
+                         diag.reshape((1, -1)))
+    return A_wave
+
+
+def calculate_random_walk_matrix(adj_mx):
+    """
+    Returns the random walk adjacency matrix. This is for D_GCN
+    """
+    adj_mx = sp.coo_matrix(adj_mx)
+    d = np.array(adj_mx.sum(1))
+    d_inv = np.power(d, -1).flatten()
+    d_inv[np.isinf(d_inv)] = 0.
+    d_mat_inv = sp.diags(d_inv)
+    random_walk_mx = d_mat_inv.dot(adj_mx).tocoo()
+    return random_walk_mx.toarray()
+
+
+class CustomDataset(Dataset):
+    def __init__(self, features, labels, domain_labels):
+        self.features = features
+        self.labels = labels
+        self.domain_labels = domain_labels
+
+    def __len__(self):
+        return len(self.features)
+
+    def __getitem__(self, idx):
+        feature = torch.tensor(self.features[idx]).to(device).float()
+        label = torch.tensor(self.labels[idx]).to(device).float()
+        domain_label = torch.tensor(self.domain_labels[idx]).to(device).float()
+
+        return feature, label, domain_label
+
+
+class MadridDatasetLoader(object):
+    def __init__(self, data_norm, device="cuda"):
+        super(MadridDatasetLoader, self).__init__()
+        self.data = data_norm
+
+    def process_data(self, time_step, pre_step, K):
+        # 假设边的权重为 1
+        self.data = np.expand_dims(self.data, axis=-1)
+        nodes, timeLength = self.data.shape[0], self.data.shape[1]
+        train_seq, train_label = [], []
+        for i in range(0, timeLength - time_step - pre_step + 1, pre_step):
+            train_seq.append(self.data[:, i: i + time_step, :])
+            train_label.append(self.data[:, i + time_step: i + time_step + pre_step, :])
+
+        self.features = np.array(train_seq)
+        self.label = train_label
+        # assignments, centers = mmd_kmeans_fixed(self.features.reshape(self.features.shape[0], -1), K) # cosine
+        assignments, centers = cosine_kmeans(self.features.reshape(self.features.shape[0], -1), K)
+        counts = Counter(assignments)  # 统计每个类别样本数，比如 {0: 50, 1: 150, 2: 100}
+        print(counts)
+
+        total_samples = len(assignments)
+
+        # 计算每个类别的权重：权重 = 1 / 类别样本比例
+        weight = []
+        for k in range(len(counts)):
+            class_count = counts[k]
+            class_weight = total_samples / (len(counts) * class_count)  # 平均分配权重和归一化
+            weight.append(class_weight)
+
+        self.weights_tensor = torch.tensor(weight, dtype=torch.float32).cuda()
+        self.domain_labels = assignments
+
+    def generate_train_data(self, time_step, pre_step, batch_size, K=2):
+        self.process_data(time_step, pre_step, K)
+        dataset = CustomDataset(self.features, self.label, self.domain_labels)
+        data_loader = DataLoader(dataset=dataset, batch_size=batch_size, shuffle=False, drop_last=True)
+        return data_loader, self.weights_tensor
+
+    def generate_test_data(self, time_step=3, pre_step=1, K=3):
+        self.process_data(time_step, pre_step, K)
+        dataset = CustomDataset(self.features, self.label, self.domain_labels)
+        data_loader = DataLoader(dataset=dataset, batch_size=len(self.label), shuffle=False, drop_last=False)
+        return data_loader
+
+
+def test(model, test_dataloader, A_q_target, A_h_target):
+    with torch.no_grad():
+        model.eval()
+        for val_input, val_target, _ in tqdm.tqdm(test_dataloader):
+            val_target = val_target.view(-1)
+            val_pred, _, _ = model(val_input, A_q_target, A_h_target)
+            prob = torch.sigmoid(val_pred)
+            # val_pred = (prob.detach().cpu().numpy() > 0.5).float()
+            # mae = np.mean(np.abs(val_pred - val_target.detach().cpu().numpy()))
+            # Rmse = math.sqrt(metrics.mean_squared_error(val_target.detach().cpu().numpy().reshape(-1), val_pred.reshape(-1)))
+            final = pd.DataFrame(val_target.detach().cpu().numpy().reshape(-1))
+            final1 = pd.DataFrame(prob.detach().cpu().numpy().reshape(-1))
+            final[final > 0] = 1
+            rouc = metrics.roc_auc_score(final, final1)
+
+            # 步骤1: 对final1中的小于1的值置为0
+            final1[final1 <= 0.5] = 0
+            final1[final1 > 0.5] = 1
+
+            f1 = metrics.f1_score(final, final1,  average='macro')
+            f2 = metrics.f1_score(final, final1,  average='micro')
+            P_Macro = metrics.precision_score(final, final1,  average='macro')
+            R_Macro = metrics.recall_score(final, final1,  average='macro')
+            print(f"f1_macro% = {f1:.3}", f"f1_micro% = {f2:.3}", f"rouc% = {rouc:.3}", f"P_Macro% = {P_Macro:.3}", f"R_Macro% = {R_Macro:.3}")
+            result = pd.concat([final,final1],axis=1)
+            return result, f1
+
+
+
+def get_domain_acc(pred, true):
+    """
+    pred: Tensor of shape [N], predicted domain labels
+    true: Tensor of shape [N], true domain labels
+    """
+    # 确保是 CPU 上的 numpy 数组
+    pred_np = pred.cpu().numpy()
+    true_np = true.cpu().numpy()
+    acc = metrics.accuracy_score(true_np, pred_np)
+
+    # F1 score (macro/micro)
+    f1_macro = metrics.f1_score(true_np, pred_np, average='macro')
+    f1_micro = metrics.f1_score(true_np, pred_np, average='micro')
+
+    return acc, f1_macro, f1_micro
+
+
+
+def train(model, train_dataloader, A_q, A_h, test_dataloader, weights, city_chinese, crime_type):
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)  #
+    epoch_training_losses, training_nll = [], []
+    vib, adv = [], []
+    vib_all, adv_all = [], []
+    hit, temp_mae = -1, 1000
+    final_model = None
+    final, final1 = None, None
+    criterion_task = nn.BCEWithLogitsLoss()
+    loss2 = nn.CrossEntropyLoss(weights.to(device), reduction='none')
+    final_acc = []
+    for epoch in range(10):
+        pred_domain_label, true_domain_label = [], []
+        encoder_result, true_domain_label = [], []
+        # tqdm 只包住源域 dataloader，跑满一个 epoch
+        for (x_src, y_src, domain_label) in tqdm.tqdm(train_dataloader, desc=f"Epoch {epoch}", leave=False):
+            optimizer.zero_grad()
+            model.train()
+            y_src = (y_src > 0).float().view(-1)  # 将非零次数都置为1，转为伯努利标签
+            domain_label = domain_label.long().to(device)
+            out_src, bound, domain_decoder_output, to_decoder = model(x_src, A_q, A_h)
+            discrimination = loss2(domain_decoder_output, domain_label)
+####################
+            # pred = torch.argmax(domain_decoder_output, dim=1)  # [batch_size]
+            # pred_domain_label.append(pred)
+            # true_domain_label.append(domain_label)
+#############
+            # 任务损失
+            loss_src = criterion_task(out_src, y_src) + 1 * torch.mean(bound) + 1 * torch.sum(discrimination)
+            total_loss = loss_src
+            total_loss.backward()
+            optimizer.step()
+            epoch_training_losses.append(loss_src.detach().cpu().numpy())
+            vib.append(torch.mean(bound).detach().cpu().numpy())
+            adv.append(torch.sum(discrimination).detach().cpu().numpy())
+            ##############
+            encoder_result.append(to_decoder.view(to_decoder.shape[1], -1).detach().cpu().numpy())
+            true_domain_label.append(domain_label.detach().cpu().numpy())
+        # result, f1 = test(model, test_dataloader, A_q, A_h)
+        all_features = np.concatenate(encoder_result, axis=0)  # shape: [N_total, 12800]
+        all_labels = np.concatenate(true_domain_label, axis=0)  # shape: [N_total]
+
+
+
+def get_model(Adj_matrix, data_robbery):
+    length = data_robbery.shape[1] - 365
+    train_data, test_data = data_robbery[:, :int(0.8 * length)], data_robbery[:,length:]
+    print(data_robbery.sum(), test_data.shape)
+
+    time_step, out_step, batch_size, k = 7, 1, 4, 2
+    train_dataloader, weights = MadridDatasetLoader(train_data).generate_train_data(time_step, out_step, batch_size, K=k)
+    test_dataloader = MadridDatasetLoader(test_data).generate_test_data(time_step, out_step)
+    A_wave = get_normalized_adj(Adj_matrix)
+    A_q = torch.from_numpy((calculate_random_walk_matrix(A_wave).T).astype('float32'))
+    A_h = torch.from_numpy((calculate_random_walk_matrix(A_wave.T).T).astype('float32'))
+    A_q = A_q.to(device=device)
+    A_h = A_h.to(device=device)
+    space_dim = data_robbery.shape[0]
+    hidden_dim_s = 70
+    hidden_dim_t = 7
+    rank_s = 20
+    rank_t = 4
+
+    # Initial networks
+    TCN1 = B_TCN(space_dim, hidden_dim_t, kernel_size=3).to(device=device)
+    TCN2 = B_TCN(hidden_dim_t, rank_t, kernel_size=3, activation='linear').to(device=device)
+    TCN3 = B_TCN(rank_t, hidden_dim_t, kernel_size=3).to(device=device)
+    # TNB = NBNorm_ZeroInflated(hidden_dim_t, space_dim).to(device=device)
+    TNB = NBNorm_MSE(hidden_dim_t, space_dim).to(device=device)
+    SCN1 = D_GCN(time_step, hidden_dim_s, 3).to(device=device)
+    SCN2 = D_GCN(hidden_dim_s, rank_s, 2, activation='linear').to(device=device)
+    SCN3 = D_GCN(rank_s, hidden_dim_s, 2).to(device=device)
+    SNB = NBNorm_MSE(hidden_dim_s, out_step).to(device=device)
+    # STmodel = ST_Gauss_VIB(SCN1, SCN2, SCN3, TCN1, TCN2, TCN3, SNB, TNB, data_robbery.shape[0] * out_step, data_robbery.shape[0] * out_step, k).to(device=device)
+    STmodel = ST_MSE_VIB(SCN1, SCN2, SCN3, TCN1, TCN2, TCN3, SNB, TNB, data_robbery.shape[0] * time_step, data_robbery.shape[0] * out_step, k).to(device=device)#多步预测
+
+    return STmodel, train_dataloader, test_dataloader, A_q, A_h, Adj_matrix, weights
