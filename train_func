@@ -18,9 +18,7 @@ device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
 
 
 def cosine_distance(A, B):
-    """
-    A, B: (N, D) 或 (K, D)，返回每对样本的余弦距离 (N,)
-    """
+
     A = A.float()
     B = B.float()
 
@@ -32,15 +30,11 @@ def cosine_distance(A, B):
     return 1 - cosine_similarity
 
 def cosine_kmeans(X, K=4, max_iter=100):
-    """
-    基于余弦距离的 K-means 聚类
-    X: (N, D) 的 torch.Tensor
-    """
+
     X = torch.tensor(X).cuda()
     N, D = X.shape
     X = X.float().to(X.device)
 
-    # 初始化中心（随机抽样）
     random.seed(-1) #纽约是0
     init_indices = random.sample(range(N), K)
     centers = X[init_indices]
@@ -48,13 +42,11 @@ def cosine_kmeans(X, K=4, max_iter=100):
     for iter in range(max_iter):
         assignments = []
 
-        # 分配每个点到最近的中心
         for i in range(N):
             xi = X[i].unsqueeze(0).repeat(K, 1)
             distances = cosine_distance(xi, centers)
             assignments.append(torch.argmin(distances).item())
 
-        # 更新中心：取每个簇的平均向量并归一化
         new_centers = []
         for k in range(K):
             indices = [i for i in range(N) if assignments[i] == k]
@@ -125,7 +117,6 @@ class MadridDatasetLoader(object):
         self.data = data_norm
 
     def process_data(self, time_step, pre_step, K):
-        # 假设边的权重为 1
         self.data = np.expand_dims(self.data, axis=-1)
         nodes, timeLength = self.data.shape[0], self.data.shape[1]
         train_seq, train_label = [], []
@@ -137,12 +128,11 @@ class MadridDatasetLoader(object):
         self.label = train_label
         # assignments, centers = mmd_kmeans_fixed(self.features.reshape(self.features.shape[0], -1), K) # cosine
         assignments, centers = cosine_kmeans(self.features.reshape(self.features.shape[0], -1), K)
-        counts = Counter(assignments)  # 统计每个类别样本数，比如 {0: 50, 1: 150, 2: 100}
+        counts = Counter(assignments) 
         print(counts)
 
         total_samples = len(assignments)
 
-        # 计算每个类别的权重：权重 = 1 / 类别样本比例
         weight = []
         for k in range(len(counts)):
             class_count = counts[k]
@@ -180,7 +170,6 @@ def test(model, test_dataloader, A_q_target, A_h_target):
             final[final > 0] = 1
             rouc = metrics.roc_auc_score(final, final1)
 
-            # 步骤1: 对final1中的小于1的值置为0
             final1[final1 <= 0.5] = 0
             final1[final1 > 0.5] = 1
 
@@ -195,11 +184,7 @@ def test(model, test_dataloader, A_q_target, A_h_target):
 
 
 def get_domain_acc(pred, true):
-    """
-    pred: Tensor of shape [N], predicted domain labels
-    true: Tensor of shape [N], true domain labels
-    """
-    # 确保是 CPU 上的 numpy 数组
+
     pred_np = pred.cpu().numpy()
     true_np = true.cpu().numpy()
     acc = metrics.accuracy_score(true_np, pred_np)
@@ -226,11 +211,10 @@ def train(model, train_dataloader, A_q, A_h, test_dataloader, weights, city_chin
     for epoch in range(10):
         pred_domain_label, true_domain_label = [], []
         encoder_result, true_domain_label = [], []
-        # tqdm 只包住源域 dataloader，跑满一个 epoch
         for (x_src, y_src, domain_label) in tqdm.tqdm(train_dataloader, desc=f"Epoch {epoch}", leave=False):
             optimizer.zero_grad()
             model.train()
-            y_src = (y_src > 0).float().view(-1)  # 将非零次数都置为1，转为伯努利标签
+            y_src = (y_src > 0).float().view(-1) 
             domain_label = domain_label.long().to(device)
             out_src, bound, domain_decoder_output, to_decoder = model(x_src, A_q, A_h)
             discrimination = loss2(domain_decoder_output, domain_label)
@@ -239,7 +223,6 @@ def train(model, train_dataloader, A_q, A_h, test_dataloader, weights, city_chin
             # pred_domain_label.append(pred)
             # true_domain_label.append(domain_label)
 #############
-            # 任务损失
             loss_src = criterion_task(out_src, y_src) + 1 * torch.mean(bound) + 1 * torch.sum(discrimination)
             total_loss = loss_src
             total_loss.backward()
